@@ -574,6 +574,20 @@ def _compile_script(script):
 		raise AutomationParamError(str(error), fieldname="script")
 
 
+class StopFlow(AutomationAction):
+	"""End the run here. Used at the end of a Fault path that should not go back to the main flow."""
+
+	action_type = "StopFlow"
+	label = "Stop the Flow"
+	description = "End the run at this step; nothing after it runs."
+	requires_document = False
+	params_schema: ClassVar[list] = []
+
+	def execute(self, doc, params, context):
+		context["skip_to"] = context["plan"]["end"]
+		return _("Stopped the flow")
+
+
 CORE_ACTIONS = [
 	SetFieldValue,
 	IncrementFieldValue,
@@ -582,4 +596,5 @@ CORE_ACTIONS = [
 	AssignToUser,
 	CallWebhook,
 	RunScript,
+	StopFlow,
 ]

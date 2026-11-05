@@ -22,7 +22,7 @@ class AutomationAction(Document):
 		from frappe.types import DF
 
 		action_type: DF.Literal[None]
-		branch: DF.Literal["", "If", "Else", "Loop"]
+		branch: DF.Literal["", "If", "Else", "Loop", "Fault"]
 		output_alias: DF.Data | None
 		params: DF.JSON | None
 		parent: DF.Data

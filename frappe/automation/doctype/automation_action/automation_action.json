@@ -80,7 +80,7 @@
    "fieldname": "branch",
    "fieldtype": "Select",
    "label": "Parent Step Branch",
-   "options": "\nIf\nElse\nLoop"
+   "options": "\nIf\nElse\nLoop\nFault"
   }
  ],
  "istable": 1,

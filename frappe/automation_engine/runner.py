@@ -43,6 +43,10 @@ STEP_JSON_FIELDS = ("condition_values", "output")
 WAIT_UNIT_SECONDS = {"Seconds": 1, "Minutes": 60, "Hours": 3600, "Days": 86400}
 
 
+# What `context.error` holds outside a Fault path: present but empty, so a template can read it.
+NO_ERROR = {"message": "", "step_key": ""}
+
+
 class StepLimitReached(frappe.ValidationError):
 	pass
 
@@ -177,6 +181,9 @@ def _context(row, run, rule, doc, event=None) -> dict:
 		"branches": state.get("branches") or {},
 		"loops": state.get("loops") or {},
 		"executed": cint(state.get("executed")),
+		# What the failed action said, while its Fault path is running; empty everywhere else.
+		"error": state.get("error") or dict(NO_ERROR),
+		"fault_span": state.get("fault_span"),
 	}
 
 
@@ -228,17 +235,44 @@ def _run_plan(steps, rule, doc, context, snapshot, start_idx=0) -> str:
 				return "Waiting"
 			if status == "Failed":
 				overall = "Partially Failed"
-				if rule.stop_on_error or context.get("limit_hit"):
+				if not _enter_fault_path(step, detail, pos, context, taken) and (
+					rule.stop_on_error or context.get("limit_hit")
+				):
 					return "Failed"
 		try:
 			following = _next_position(snapshot, context, pos, start_idx)
 		except StepLimitReached as error:
 			_append_step(steps, step, pos, "Failed", _limit_note(error), 0, _iteration(context, pos))
 			return "Failed"
+		_leave_fault_path(context, following)
 		if following != pos + 1:
 			start_idx = 0
 		pos = following
 	return overall
+
+
+def _enter_fault_path(step, detail, pos, context, taken) -> bool:
+	"""Hand a failed action to its Fault path, when it has one and the failure may be handled.
+
+	The steps of that path sit right after the action; marking the action's arm as "Fault" makes
+	them the ones the walk takes next. The limit on the run is never handled this way.
+	"""
+	end = context["plan"]["fault_end"].get(pos)
+	if end is None or context.get("limit_hit"):
+		return False
+	taken[_branch_key(step.get("idx"))] = "Fault"
+	message = detail.get("message") if isinstance(detail, dict) else None
+	context["error"] = {"message": message or str(detail), "step_key": step.get("step_key") or ""}
+	context["fault_span"] = [pos, end]
+	return True
+
+
+def _leave_fault_path(context, following):
+	"""Forget the error once the walk is past the Fault path (or has jumped out of it)."""
+	span = context.get("fault_span")
+	if span and not span[0] < following <= span[1]:
+		context["error"] = dict(NO_ERROR)
+		context["fault_span"] = None
 
 
 def _safe_step_outcome(registry, step, doc, context, pos, start_idx, taken):
@@ -309,7 +343,13 @@ def _plan_layout(snapshot) -> dict:
 		"inner_loops": {},
 		"loop_keys": {loop_pos: _branch_key(snapshot[loop_pos]["idx"]) for loop_pos in loops},
 		"positions": {step["step_key"]: pos for pos, step in enumerate(snapshot)},
+		"end": len(snapshot),
+		"fault_end": {},
 	}
+	for pos in range(len(snapshot)):
+		body = [other for other in range(len(snapshot)) if _inside(parent, other, pos)]
+		if body and any(snapshot[other].get("branch") == "Fault" for other in body):
+			layout["fault_end"][pos] = max(body)
 	for loop_pos in loops:
 		body = [pos for pos in range(len(snapshot)) if _inside(parent, pos, loop_pos)]
 		layout["inner_loops"][loop_pos] = [other for other in loops if _inside(parent, other, loop_pos)]
@@ -684,7 +724,8 @@ def _ms(started) -> int:
 
 
 def _finalize(run, rule, row, status, steps, error=None, context=None):
-	error_summary = error or _error_summary(status, steps)
+	handled = bool(context) and "Fault" in context["branches"].values()
+	error_summary = error or _error_summary(status, steps, handled)
 	run.update(_run_values(status, steps, error_summary, context))
 	# The target may have been deleted since the run started (notably across a Wait, or on a
 	# Doc Deleted trigger); the run must still record its outcome, so skip link validation.
@@ -728,6 +769,8 @@ def _run_values(status, steps, error_summary, context=None) -> dict:
 				"branches": context["branches"],
 				"loops": context["loops"],
 				"executed": context["executed"],
+				"error": context["error"],
+				"fault_span": context["fault_span"],
 			}
 		)
 	if status != "Waiting":
@@ -755,14 +798,19 @@ def _settle_queue_row(row, status):
 		frappe.db.set_value(QUEUE, row.name, "status", status, update_modified=False)
 
 
-def _error_summary(status, steps) -> str | None:
-	"""One line for the run list. The app's own thrown message beats a traceback tail."""
+def _error_summary(status, steps, handled=False) -> str | None:
+	"""One line for the run list. The app's own thrown message beats a traceback tail.
+
+	A run that recovered through a Fault path names the step that failed, since the status alone
+	(Partially Failed) would not say where.
+	"""
 	if status not in ("Failed", "Partially Failed"):
 		return None
 	failed = next((step for step in steps if step["status"] == "Failed"), None)
 	message = (failed or {}).get("message")
 	if message:
-		return message.splitlines()[0][:140]
+		line = message.splitlines()[0][:140]
+		return f"{failed['step_key']}: {line}" if handled and failed.get("step_key") else line
 	detail = _first_error_detail(steps)
 	return detail.splitlines()[-1][:140] if detail else "Failed"
 

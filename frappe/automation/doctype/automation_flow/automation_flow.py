@@ -88,6 +88,10 @@ class AutomationFlow(Document):
 			self.validate_step(row)
 			self.validate_branch(row)
 			self.validate_action_aliases(row, targets)
+			if (row.step_type or "Action") == "Action" and any(
+				r.parent_step == row.idx and r.branch == "Fault" for r in self.actions
+			):
+				self.validate_fault_body(row)
 			if row.step_type == "Loop":
 				self.validate_loop(row, targets, record_sources)
 				continue
@@ -206,6 +210,8 @@ class AutomationFlow(Document):
 			return
 		if row.parent_step >= row.idx:
 			frappe.throw(_("Row {0}: Parent Step must be an earlier row").format(row.idx))
+		if row.branch == "Fault":
+			return self.validate_fault_branch(row)
 		parent = self.block_at(row.parent_step)
 		if not parent:
 			frappe.throw(
@@ -216,6 +222,24 @@ class AutomationFlow(Document):
 				_("Row {0}: choose the {1} branch").format(
 					row.idx, " or ".join(BLOCK_BRANCHES[parent.step_type])
 				)
+			)
+
+	def validate_fault_branch(self, row):
+		"""A Fault step belongs to the action it recovers from, and nothing else can own one."""
+		parent = next((r for r in self.actions if r.idx == row.parent_step), None)
+		if not parent or (parent.step_type or "Action") != "Action":
+			frappe.throw(
+				_("Row {0}: a Fault path belongs to an action step, not to row {1}").format(
+					row.idx, row.parent_step
+				)
+			)
+
+	def validate_fault_body(self, row):
+		"""The steps of an action's Fault path directly follow it, so the walk reaches them in order."""
+		body = sorted(r.idx for r in self.actions if self.is_inside(r, row.idx))
+		if body != list(range(row.idx + 1, body[-1] + 1)):
+			frappe.throw(
+				_("Row {0}: the steps of a Fault path must follow their action without gaps").format(row.idx)
 			)
 
 	def if_step_at(self, idx):
