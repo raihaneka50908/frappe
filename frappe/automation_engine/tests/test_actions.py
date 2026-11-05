@@ -110,6 +110,49 @@ class TestActions(IntegrationTestCase):
 		)
 		self.assertTrue(frappe.db.exists("ToDo", {"description": "prio-High"}))
 
+	def test_render_value_renders_templates_nested_in_lists_and_maps(self):
+		from frappe.automation_engine.actions.base import render_value
+
+		src = make_todo(priority="High")
+		rendered = render_value(
+			[
+				{
+					"link_doctype": "ToDo",
+					"link_name": "{{ doc.name }}",
+					"idx": 3,
+					"nested": ["{{ doc.priority }}", None],
+				}
+			],
+			src,
+			{},
+		)
+		self.assertEqual(
+			rendered,
+			[{"link_doctype": "ToDo", "link_name": src.name, "idx": 3, "nested": ["High", None]}],
+		)
+
+	def test_render_value_leaves_plain_values_alone(self):
+		from frappe.automation_engine.actions.base import render_value
+
+		value = {"a": [1, 2.5, True, None, "plain"], "b": {"c": "no braces"}}
+		self.assertEqual(render_value(value, None, {}), value)
+
+	def test_create_document_renders_templates_inside_child_table_rows(self):
+		src = make_todo()
+		CreateDocument().execute(
+			src,
+			{
+				"doctype": "Contact",
+				"values": {
+					"first_name": "tbl-{{ doc.priority }}",
+					"links": [{"link_doctype": "ToDo", "link_name": "{{ doc.name }}"}],
+				},
+			},
+			{},
+		)
+		contact = frappe.get_last_doc("Contact", filters={"first_name": "tbl-Medium"})
+		self.assertEqual([(row.link_doctype, row.link_name) for row in contact.links], [("ToDo", src.name)])
+
 	def test_assign_to_user(self):
 		note = frappe.get_doc({"doctype": "Note", "title": "assign-me", "public": 1}).insert()
 		AssignToUser().execute(note, {"assign_to": ["Administrator"]}, {})

@@ -23,12 +23,21 @@ USER_CONTROL = "users"
 
 
 def render_value(value, doc, context=None):
-	"""Render a Jinja-templated string against the document; pass through non-templates."""
+	"""Render a Jinja-templated string against the document; pass through non-templates.
+
+	Lists and maps are walked, so a child table row such as
+	`{"link_doctype": "Customer", "link_name": "{{ context.records.customer.name }}"}` renders its
+	cells the same way a top-level value does.
+	"""
 	if isinstance(value, str) and "{{" in value:
 		# The template is an action parameter, authored by the System Manager who configured the
 		# flow - the same trust model as Notification and Email Template.
 		# nosemgrep
 		return frappe.render_template(value, render_context(doc, context))
+	if isinstance(value, list | tuple):
+		return [render_value(item, doc, context) for item in value]
+	if isinstance(value, dict):
+		return {key: render_value(item, doc, context) for key, item in value.items()}
 	return value
 
 
