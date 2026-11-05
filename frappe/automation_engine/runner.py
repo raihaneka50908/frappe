@@ -248,6 +248,8 @@ def _execution_identity(rule, row, doc):
 
 
 def _execution_user(rule, row, doc):
+	if frappe.flags.get("in_automation_trial") and frappe.flags.get("automation_run_as"):
+		return frappe.flags.automation_run_as
 	if rule.run_as == "Triggering User":
 		return row.triggered_by or rule.owner
 	if rule.run_as == "Document Owner" and doc:

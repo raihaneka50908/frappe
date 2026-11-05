@@ -7,7 +7,7 @@ from contextlib import contextmanager
 import frappe
 from frappe import _
 from frappe.automation_engine.actions.base import AutomationParamError, get_action, get_action_registry
-from frappe.automation_engine.dispatch import kick_drainer, queue_trigger
+from frappe.automation_engine.dispatch import kick_drainer, queue_trigger, start_conditions_met
 from frappe.automation_engine.events import registered_events
 from frappe.automation_engine.queue import QUEUE
 from frappe.automation_engine.relationships import get_relationship_definitions
@@ -210,28 +210,69 @@ TRIAL_SAVEPOINT = "automation_trial"
 
 @frappe.whitelist()
 def trial_run(
-	automation: str, docname: str | None = None, branch_overrides: dict | str | None = None
+	automation: str,
+	docname: str | None = None,
+	branch_overrides: dict | str | None = None,
+	skip_conditions: int | bool = 0,
+	run_as: str | None = None,
 ) -> dict:
 	"""Execute `automation` against `docname` for real, then roll everything back.
 
 	The runner builds its trace in memory, so the rollback discards every write the run made
 	and still leaves the trace to return. `branch_overrides` maps an If step's idx to the arm
 	to take, so the arm this record would not reach can still be tried.
+
+	A record that does not meet the flow's start conditions is not run, as it would not be in
+	real life; `skip_conditions` runs it anyway. `run_as` (System Manager only) runs the steps as
+	another user, to see what that user's permissions allow.
 	"""
 	rule = _trial_target(automation, docname)
 	overrides = _branch_overrides(rule, branch_overrides)
+	user = _trial_user(run_as)
+	met = _start_conditions_met(rule, docname)
+	if not met and not cint(skip_conditions):
+		return {
+			"status": "Skipped",
+			"document": docname,
+			"steps": [],
+			"branches": {},
+			"error_summary": _(
+				"The record does not meet the flow's start conditions, so the flow would not run."
+			),
+			"usage": None,
+			"conditions_met": False,
+			"conditions_skipped": False,
+		}
 	frappe.db.savepoint(TRIAL_SAVEPOINT)
 	try:
-		with _trial_mode(overrides):
+		with _trial_mode(overrides, user):
 			row_name = _trial_queue_row(rule, docname)
 			execute_automation(row_name)
-			return _trial_result(row_name, docname)
+			result = _trial_result(row_name, docname)
+			result["conditions_met"] = met
+			result["conditions_skipped"] = not met
+			return result
 	finally:
 		frappe.db.rollback(save_point=TRIAL_SAVEPOINT)
 
 
+def _start_conditions_met(rule, docname) -> bool:
+	if not (docname and rule.document_type):
+		return True
+	return start_conditions_met(rule, frappe.get_doc(rule.document_type, docname))
+
+
+def _trial_user(run_as: str | None) -> str | None:
+	if not run_as:
+		return None
+	frappe.only_for("System Manager")
+	if not frappe.db.get_value("User", run_as, "enabled"):
+		frappe.throw(_("User {0} is disabled or does not exist").format(run_as))
+	return run_as
+
+
 @contextmanager
-def _trial_mode(branch_overrides: dict):
+def _trial_mode(branch_overrides: dict, run_as: str | None = None):
 	"""Keep the trial inside the transaction, and out of the flow's live bookkeeping.
 
 	An action that commits mid-step would make the trial real, and the circuit breaker (Redis)
@@ -240,15 +281,18 @@ def _trial_mode(branch_overrides: dict):
 	original = frappe.db.commit
 	previous = frappe.flags.get("in_automation_trial")
 	previous_overrides = frappe.flags.get("automation_branch_overrides")
+	previous_user = frappe.flags.get("automation_run_as")
 	frappe.db.commit = lambda *args, **kwargs: None
 	frappe.flags.in_automation_trial = True
 	frappe.flags.automation_branch_overrides = branch_overrides
+	frappe.flags.automation_run_as = run_as
 	try:
 		yield
 	finally:
 		frappe.db.commit = original
 		frappe.flags.in_automation_trial = previous
 		frappe.flags.automation_branch_overrides = previous_overrides
+		frappe.flags.automation_run_as = previous_user
 
 
 def _branch_overrides(rule, overrides) -> dict:

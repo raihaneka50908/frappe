@@ -78,15 +78,35 @@ def matches_rule(rule, doc) -> bool:
 	try:
 		if rule.trigger_type == "Field Value Changed" and not _field_changed(rule, doc):
 			return False
-		if rule.filters and not evaluate_filter_tree(doc, frappe.parse_json(rule.filters)):
-			return False
-		return not rule.condition or bool(frappe.safe_eval(rule.condition, None, {"doc": doc}))
+		return _meets_conditions(rule, doc)
 	except Exception:
 		frappe.log_error(
 			title=f"Automation Flow match failed: {rule.name}",
 			message=frappe.get_traceback(),
 		)
 		return False
+
+
+def start_conditions_met(rule, doc) -> bool:
+	"""Whether `doc` meets the rule's filters and condition, leaving aside what changed on it.
+
+	A test run uses this: a stored record has no "before" version, so whether a field just
+	changed cannot be judged, but the conditions on the record itself can.
+	"""
+	try:
+		return _meets_conditions(rule, doc)
+	except Exception:
+		frappe.log_error(
+			title=f"Automation Flow match failed: {rule.name}",
+			message=frappe.get_traceback(),
+		)
+		return False
+
+
+def _meets_conditions(rule, doc) -> bool:
+	if rule.filters and not evaluate_filter_tree(doc, frappe.parse_json(rule.filters)):
+		return False
+	return not rule.condition or bool(frappe.safe_eval(rule.condition, None, {"doc": doc}))
 
 
 def _field_changed(rule, doc) -> bool:
