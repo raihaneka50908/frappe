@@ -21,8 +21,8 @@ class AutomationAction(Document):
 	if TYPE_CHECKING:
 		from frappe.types import DF
 
-		action_type: DF.Data | None
-		branch: DF.Literal["", "If", "Else"]
+		action_type: DF.Literal[None]
+		branch: DF.Literal["", "If", "Else", "Loop"]
 		output_alias: DF.Data | None
 		params: DF.JSON | None
 		parent: DF.Data
@@ -32,7 +32,7 @@ class AutomationAction(Document):
 		related_condition: DF.JSON | None
 		step_condition: DF.Code | None
 		step_key: DF.Data | None
-		step_type: DF.Literal["Action", "Wait", "If", "Else"]
+		step_type: DF.Data | None
 		target: DF.Data | None
 	# end: auto-generated types
 

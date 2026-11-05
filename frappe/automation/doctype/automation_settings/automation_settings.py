@@ -19,7 +19,9 @@ class AutomationSettings(Document):
 		drain_seconds: DF.Float
 		event_payload_limit: DF.Int
 		failure_threshold: DF.Int
+		max_attempts: DF.Int
 		max_depth: DF.Int
+		max_steps_per_run: DF.Int
 		queue_retention_days: DF.Int
 		stale_running_minutes: DF.Int
 		step_output_limit: DF.Int

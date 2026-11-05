@@ -19,6 +19,7 @@ class AutomationRunStep(Document):
 		detail: DF.LongText | None
 		duration_ms: DF.Int
 		exception: DF.Data | None
+		iteration: DF.Int
 		message: DF.SmallText | None
 		output: DF.JSON | None
 		parent: DF.Data

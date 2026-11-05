@@ -19,6 +19,7 @@
   "queue_retention_days",
   "limits_section",
   "step_output_limit",
+  "max_steps_per_run",
   "event_payload_limit",
   "column_break_limits",
   "allow_unregistered_events"
@@ -137,11 +138,17 @@
    "fieldname": "allow_unregistered_events",
    "fieldtype": "Check",
    "label": "Allow Unregistered Events"
+  },
+  {
+   "description": "Stops a run that executes more steps than this, which keeps loops and jumps from running forever.",
+   "fieldname": "max_steps_per_run",
+   "fieldtype": "Int",
+   "label": "Maximum Steps Per Run"
   }
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-08-18 18:52:57.661314",
+ "modified": "2026-11-05 04:20:28.807757",
  "modified_by": "Administrator",
  "module": "Automation",
  "name": "Automation Settings",

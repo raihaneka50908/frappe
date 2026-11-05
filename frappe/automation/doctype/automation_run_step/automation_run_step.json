@@ -8,6 +8,7 @@
  "field_order": [
   "step_idx",
   "step_key",
+  "iteration",
   "action_type",
   "status",
   "duration_ms",
@@ -92,13 +93,19 @@
    "fieldname": "output",
    "fieldtype": "JSON",
    "label": "Output"
+  },
+  {
+   "fieldname": "iteration",
+   "fieldtype": "Int",
+   "label": "Iteration",
+   "read_only": 1
   }
  ],
  "grid_page_length": 50,
- "index_web_pages_for_search": 1,
  "istable": 1,
+ "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2026-09-29 14:15:18.764349",
+ "modified": "2026-11-05 04:20:25.054363",
  "modified_by": "Administrator",
  "module": "Automation",
  "name": "Automation Run Step",

@@ -23,9 +23,11 @@ from frappe.automation_engine.relationships import load_record, resolve_relation
 from frappe.utils import add_to_date, cint, now
 
 RUN = "Automation Run"
+LOOP_ARM = "Loop"
 STEP_FIELDS = (
 	"step_idx",
 	"step_key",
+	"iteration",
 	"action_type",
 	"status",
 	"detail",
@@ -39,6 +41,10 @@ STEP_FIELDS = (
 )
 STEP_JSON_FIELDS = ("condition_values", "output")
 WAIT_UNIT_SECONDS = {"Seconds": 1, "Minutes": 60, "Hours": 3600, "Days": 86400}
+
+
+class StepLimitReached(frappe.ValidationError):
+	pass
 
 
 def execute_automation(queue_name: str):
@@ -169,6 +175,8 @@ def _context(row, run, rule, doc, event=None) -> dict:
 		"steps": state.get("step_outputs") or {},
 		"records": state.get("records") or resolve_relationships(doc, frappe.parse_json(run.relationships)),
 		"branches": state.get("branches") or {},
+		"loops": state.get("loops") or {},
+		"executed": cint(state.get("executed")),
 	}
 
 
@@ -202,28 +210,42 @@ def _ensure_trigger_access(doc):
 
 
 def _run_plan(steps, rule, doc, context, snapshot, start_idx=0) -> str:
-	"""Walk the snapshot once, honouring branch arms and skipping what already ran."""
+	"""Walk the snapshot, honouring branch arms, loops and jumps, and skipping what already ran."""
 	registry = get_action_registry()
 	taken = context["branches"]
+	context["plan"] = _plan_layout(snapshot)
 	overall = "Success"
-	for pos, step in enumerate(snapshot):
+	pos = 0
+	while pos < len(snapshot):
+		step = snapshot[pos]
+		if pos >= start_idx:
+			start_idx = 0
 		status, detail, duration = _safe_step_outcome(registry, step, doc, context, pos, start_idx, taken)
-		if status is None:
-			continue
-		entry = _append_step(steps, step, pos, status, detail, duration)
-		_update_context(context, step, entry)
-		if status == "Waiting":
-			return "Waiting"
-		if status == "Failed":
-			overall = "Partially Failed"
-			if rule.stop_on_error:
-				return "Failed"
+		if status is not None:
+			entry = _append_step(steps, step, pos, status, detail, duration, _iteration(context, pos))
+			_update_context(context, step, entry)
+			if status == "Waiting":
+				return "Waiting"
+			if status == "Failed":
+				overall = "Partially Failed"
+				if rule.stop_on_error or context.get("limit_hit"):
+					return "Failed"
+		try:
+			following = _next_position(snapshot, context, pos, start_idx)
+		except StepLimitReached as error:
+			_append_step(steps, step, pos, "Failed", _limit_note(error), 0, _iteration(context, pos))
+			return "Failed"
+		if following != pos + 1:
+			start_idx = 0
+		pos = following
 	return overall
 
 
 def _safe_step_outcome(registry, step, doc, context, pos, start_idx, taken):
 	try:
 		return _step_outcome(registry, step, doc, context, pos, start_idx, taken)
+	except StepLimitReached as error:
+		return "Failed", _limit_note(error), 0
 	except Exception:
 		return "Failed", frappe.get_traceback(), 0
 
@@ -237,13 +259,168 @@ def _step_outcome(registry, step, doc, context, pos, start_idx, taken):
 		return _resolve_if(step, doc, context, pos, start_idx, taken)
 	if pos < start_idx:
 		return None, None, None  # already executed in the leg before the wait
+	_count_step(context)
 	if not _step_condition_matches(step, doc, context):
 		return "Skipped", _skip_detail(step, doc, context), 0
 	if step_type == "Wait":
 		return _begin_wait(step, context, pos)
 	if step_type == "WaitForEvent":
 		return _begin_event_wait(step, context, pos)
+	if step_type == "Loop":
+		return _begin_loop(step, context, pos)
+	if step_type == "Jump":
+		return _jump(step, context)
 	return _run_one(registry, step, doc, context, pos)
+
+
+def _count_step(context):
+	"""Count one step execution against the run's budget; a loop or jump cannot outlive it."""
+	context["executed"] += 1
+	limit = settings.get("max_steps_per_run")
+	if context["executed"] > limit:
+		context["limit_hit"] = True
+		raise StepLimitReached(_("Step limit reached ({0})").format(limit))
+
+
+def _limit_note(error) -> dict:
+	return {
+		"note": True,
+		"detail": str(error),
+		"message": str(error),
+		"exception": f"{type(error).__module__}.{type(error).__name__}",
+	}
+
+
+def _plan_layout(snapshot) -> dict:
+	"""Where each block starts and ends, so the walk can loop back and jump without rescanning.
+
+	`body_end` maps a Loop's position to the position of its last body step, `loops_ending_at`
+	lists the Loops that close at a position (innermost first), `enclosing` maps a position to its
+	nearest Loop, `inner_loops` maps a Loop to the Loops nested inside it, and `positions` maps
+	step keys to positions for Jump targets.
+	"""
+	by_idx = {cint(step["idx"]): pos for pos, step in enumerate(snapshot)}
+	parent = {pos: by_idx.get(cint(step.get("parent_step"))) for pos, step in enumerate(snapshot)}
+	loops = [pos for pos, step in enumerate(snapshot) if step.get("step_type") == "Loop"]
+	layout = {
+		"body_end": {},
+		"loops_ending_at": {},
+		"enclosing": {},
+		"inner_loops": {},
+		"loop_keys": {loop_pos: _branch_key(snapshot[loop_pos]["idx"]) for loop_pos in loops},
+		"positions": {step["step_key"]: pos for pos, step in enumerate(snapshot)},
+	}
+	for loop_pos in loops:
+		body = [pos for pos in range(len(snapshot)) if _inside(parent, pos, loop_pos)]
+		layout["inner_loops"][loop_pos] = [other for other in loops if _inside(parent, other, loop_pos)]
+		if not body:
+			continue
+		layout["body_end"][loop_pos] = max(body)
+		layout["loops_ending_at"].setdefault(max(body), []).append(loop_pos)
+		for pos in body:
+			if pos not in layout["enclosing"] or layout["enclosing"][pos] < loop_pos:
+				layout["enclosing"][pos] = loop_pos
+	for ending in layout["loops_ending_at"].values():
+		ending.sort(reverse=True)
+	return layout
+
+
+def _inside(parent, pos, ancestor) -> bool:
+	pos = parent.get(pos)
+	while pos is not None:
+		if pos == ancestor:
+			return True
+		pos = parent.get(pos)
+	return False
+
+
+def _iteration(context, pos) -> int | None:
+	"""The current round of the Loop this position sits in, if any."""
+	loop_pos = context["plan"]["enclosing"].get(pos)
+	state = _loop_state(context, loop_pos) if loop_pos is not None else None
+	return state["index"] + 1 if state else None
+
+
+def _loop_state(context, loop_pos) -> dict | None:
+	return context["loops"].get(context["plan"]["loop_keys"][loop_pos])
+
+
+def _next_position(snapshot, context, pos, start_idx) -> int:
+	"""Where the walk goes after `pos`: a jump target, the next round of a Loop, or the next row."""
+	jump = context.pop("jump_to", None)
+	if jump is not None:
+		return jump
+	skip = context.pop("skip_to", None)
+	if skip is not None:
+		return skip
+	if pos < start_idx - 1:
+		return pos + 1
+	for loop_pos in context["plan"]["loops_ending_at"].get(pos, ()):
+		if _advance_loop(snapshot, context, loop_pos):
+			return loop_pos + 1
+	return pos + 1
+
+
+def _begin_loop(step, context, pos):
+	started = time.monotonic()
+	params = _step_params(step)
+	records = _loop_records(params, context)
+	plan = context["plan"]
+	if not records:
+		context["skip_to"] = plan["body_end"].get(pos, pos) + 1
+		return "Success", _("Loop has no records"), _ms(started)
+	key = plan["loop_keys"][pos]
+	context["loops"][key] = {"records": records, "index": 0}
+	context["branches"][key] = LOOP_ARM
+	_bind_loop_item(step, context, records[0])
+	return (
+		"Success",
+		{"detail": _("Looping over {0} records").format(len(records)), "count": len(records)},
+		_ms(started),
+	)
+
+
+def _loop_records(params, context) -> list:
+	source = params.get("source")
+	output = context["steps"].get(source)
+	records = output.get("records") if isinstance(output, dict) else None
+	if not isinstance(records, list):
+		raise ValueError(_("Loop source {0} did not return a list of records").format(source))
+	return records
+
+
+def _bind_loop_item(step, context, record):
+	context["records"][_step_params(step)["item_alias"]] = record
+
+
+def _advance_loop(snapshot, context, loop_pos) -> bool:
+	"""Move a Loop that just ran its last body step to its next record. False once it is spent."""
+	plan = context["plan"]
+	key = plan["loop_keys"][loop_pos]
+	state = context["loops"].get(key)
+	if not state or context["branches"].get(key) != LOOP_ARM:
+		return False
+	for inner in plan["inner_loops"][loop_pos]:
+		inner_key = plan["loop_keys"][inner]
+		context["loops"].pop(inner_key, None)
+		context["branches"].pop(inner_key, None)
+	state["index"] += 1
+	if state["index"] >= len(state["records"]):
+		context["loops"].pop(key)
+		context["branches"].pop(key)
+		return False
+	_count_step(context)
+	_bind_loop_item(snapshot[loop_pos], context, state["records"][state["index"]])
+	return True
+
+
+def _jump(step, context):
+	target = _step_params(step).get("target_step_key")
+	position = context["plan"]["positions"].get(target)
+	if position is None:
+		raise ValueError(_("Jump target {0} is not a step of this flow").format(target))
+	context["jump_to"] = position
+	return "Success", _("Jumped to {0}").format(target), 0
 
 
 def _branch_active(step, taken) -> bool:
@@ -276,6 +453,7 @@ def _resolve_if(step, doc, context, pos, start_idx, taken):
 			return None, None, None
 		taken[key] = forced or _evaluated_arm(step, doc, context)
 		return None, None, None
+	_count_step(context)
 	taken[key] = arm = forced or _evaluated_arm(step, doc, context)
 	if forced:
 		return "Success", _("Forced the {0} branch").format(arm), 0
@@ -443,12 +621,13 @@ def _step_condition_matches(step, doc, context) -> bool:
 	return bool(frappe.safe_eval(condition, None, {"doc": doc, "target": target, "context": context}))
 
 
-def _append_step(steps, step, idx, status, detail, duration):
+def _append_step(steps, step, idx, status, detail, duration, iteration=None):
 	note = detail if isinstance(detail, dict) and detail.get("note") else {}
 	detail, output = (note["detail"], None) if note else _action_result(detail)
 	entry = {
 		"step_idx": idx,
 		"step_key": step.get("step_key") or f"step_{idx + 1}",
+		"iteration": iteration,
 		"action_type": step.get("action_type") or step.get("step_type") or "Action",
 		"status": status,
 		"detail": (detail or "")[:5000],
@@ -547,6 +726,8 @@ def _run_values(status, steps, error_summary, context=None) -> dict:
 				"step_outputs": context["steps"],
 				"records": context["records"],
 				"branches": context["branches"],
+				"loops": context["loops"],
+				"executed": context["executed"],
 			}
 		)
 	if status != "Waiting":

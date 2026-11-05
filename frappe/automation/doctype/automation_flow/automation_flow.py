@@ -6,8 +6,9 @@ from frappe import _
 from frappe.automation_engine.registry import DOC_TRIGGER_TYPES, clear_automation_cache
 from frappe.model.document import Document
 
-STEP_TYPES = ("Action", "Wait", "WaitForEvent", "If")
+STEP_TYPES = ("Action", "Wait", "WaitForEvent", "If", "Loop", "Jump")
 WAIT_STEP_TYPES = ("Wait", "WaitForEvent")
+BLOCK_BRANCHES = {"If": ("If", "Else"), "Loop": ("Loop",)}
 WAIT_UNITS = ("Seconds", "Minutes", "Hours", "Days")
 
 
@@ -80,19 +81,79 @@ class AutomationFlow(Document):
 		from frappe.automation_engine.actions.base import get_action
 
 		keys = set()
+		record_sources = {}
 		targets = self.get_action_targets()
 		for row in self.actions:
 			self.set_step_key(row, keys)
 			self.validate_step(row)
 			self.validate_branch(row)
 			self.validate_action_aliases(row, targets)
+			if row.step_type == "Loop":
+				self.validate_loop(row, targets, record_sources)
+				continue
+			if row.step_type == "Jump":
+				self.validate_jump(row)
+				continue
 			if row.step_type in (*WAIT_STEP_TYPES, "If"):
 				continue
 			action = get_action(row.action_type)
 			self.validate_action_context(action)
-			self.validate_action_params(action, row, targets)
+			self.validate_action_params(action, row, targets, record_sources)
 
-	def validate_action_params(self, action, row, targets):
+	def validate_loop(self, row, targets, record_sources):
+		params = frappe.parse_json(row.params) if row.params else {}
+		source, alias = params.get("source"), params.get("item_alias")
+		if source not in record_sources:
+			frappe.throw(
+				_(
+					"Row {0}: Loop source must be the Step Key of an earlier action that returns records"
+				).format(row.idx)
+			)
+		if not alias:
+			frappe.throw(_("Row {0}: Loop needs an Item Alias").format(row.idx))
+		if alias in targets:
+			frappe.throw(_("Row {0}: duplicate Item Alias {1}").format(row.idx, alias))
+		targets[alias] = record_sources[source]
+		self.validate_loop_body(row)
+
+	def validate_loop_body(self, row):
+		body = sorted(r.idx for r in self.actions if self.is_inside(r, row.idx))
+		if not body:
+			frappe.throw(_("Row {0}: a Loop needs at least one step inside it").format(row.idx))
+		if body != list(range(row.idx + 1, body[-1] + 1)):
+			frappe.throw(_("Row {0}: the steps inside a Loop must follow it without gaps").format(row.idx))
+
+	def is_inside(self, row, block_idx):
+		parent = row.parent_step
+		while parent:
+			if parent == block_idx:
+				return True
+			parent = next((r.parent_step for r in self.actions if r.idx == parent), 0)
+		return False
+
+	def validate_jump(self, row):
+		params = frappe.parse_json(row.params) if row.params else {}
+		key = params.get("target_step_key")
+		target = next((r for r in self.actions if r.step_key == key and r.idx < row.idx), None)
+		if not target:
+			frappe.throw(_("Row {0}: Jump must target the Step Key of an earlier step").format(row.idx))
+		if (target.parent_step or 0, target.branch or "") not in self.jump_scope(row):
+			frappe.throw(
+				_("Row {0}: Jump cannot leave its Loop or enter a block from outside").format(row.idx)
+			)
+
+	def jump_scope(self, row):
+		"""The (parent step, branch) pairs a Jump may land in: its own block and the ones around
+		it, up to the nearest Loop, which a Jump cannot leave."""
+		scope = []
+		while True:
+			scope.append((row.parent_step or 0, row.branch or ""))
+			parent = self.block_at(row.parent_step)
+			if not parent or parent.step_type == "Loop":
+				return scope
+			row = parent
+
+	def validate_action_params(self, action, row, targets, record_sources=None):
 		"""An action reports a bad param by raising, which reaches the user as a bare 500;
 		rethrowing it names the row and reads like every other save error."""
 		from frappe.automation_engine.actions.base import AutomationParamError
@@ -103,6 +164,8 @@ class AutomationFlow(Document):
 		except AutomationParamError as e:
 			frappe.throw(_("Row {0}: {1}").format(row.idx, str(e)))
 		targets.update(action.output_targets(params, row.output_alias))
+		if record_sources is not None and "records" in (action.output_schema or {}):
+			record_sources[row.step_key] = action.output_doctype(params)
 
 	def get_action_targets(self):
 		from frappe.automation_engine.relationships import get_relationship_targets
@@ -134,20 +197,32 @@ class AutomationFlow(Document):
 			frappe.throw(_("Automation User {0} is disabled or missing").format(self.automation_user))
 
 	def validate_branch(self, row):
-		"""A step inside an If must name that If (by idx) and which arm it belongs to."""
+		"""A step inside an If or Loop must name that block (by idx) and which arm it belongs to."""
 		if not row.parent_step:
 			if row.branch:
-				frappe.throw(_("Row {0}: Branch is only meaningful inside an If step").format(row.idx))
+				frappe.throw(
+					_("Row {0}: Branch is only meaningful inside an If or Loop step").format(row.idx)
+				)
 			return
 		if row.parent_step >= row.idx:
 			frappe.throw(_("Row {0}: Parent Step must be an earlier row").format(row.idx))
-		if not self.if_step_at(row.parent_step):
-			frappe.throw(_("Row {0}: Parent Step {1} is not an If step").format(row.idx, row.parent_step))
-		if row.branch not in ("If", "Else"):
-			frappe.throw(_("Row {0}: choose the If or Else branch").format(row.idx))
+		parent = self.block_at(row.parent_step)
+		if not parent:
+			frappe.throw(
+				_("Row {0}: Parent Step {1} is not an If or Loop step").format(row.idx, row.parent_step)
+			)
+		if row.branch not in BLOCK_BRANCHES[parent.step_type]:
+			frappe.throw(
+				_("Row {0}: choose the {1} branch").format(
+					row.idx, " or ".join(BLOCK_BRANCHES[parent.step_type])
+				)
+			)
 
 	def if_step_at(self, idx):
 		return next((r for r in self.actions if r.idx == idx and r.step_type == "If"), None)
+
+	def block_at(self, idx):
+		return next((r for r in self.actions if r.idx == idx and r.step_type in BLOCK_BRANCHES), None)
 
 	def validate_action_context(self, action):
 		if action.requires_document and not self.document_type:

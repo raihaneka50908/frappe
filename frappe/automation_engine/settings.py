@@ -17,6 +17,7 @@ DEFAULTS = frappe._dict(
 	commit_every=50,
 	queue_retention_days=7,
 	step_output_limit=65536,
+	max_steps_per_run=1000,
 	event_payload_limit=65536,
 	allow_unregistered_events=0,
 )
