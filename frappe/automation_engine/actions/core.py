@@ -7,6 +7,7 @@ from urllib.parse import urljoin, urlparse
 
 import frappe
 from frappe import _
+from frappe.automation_engine import usage
 from frappe.automation_engine.actions.base import (
 	USER_CONTROL,
 	AutomationAction,
@@ -76,6 +77,7 @@ class SetFieldValue(AutomationAction):
 		for field, value in pairs.items():
 			doc.set(field, render_value(value, doc, context))
 		doc.save()
+		usage.report(writes=1, records_changed=1)
 		return _("Set {0}").format(", ".join(pairs))
 
 	def _pairs(self, params) -> dict:
@@ -127,6 +129,7 @@ class CreateDocument(AutomationAction):
 		for field, value in (values or {}).items():
 			target.set(field, render_value(value, doc, context))
 		target.insert()
+		usage.report(writes=1, records_changed=1)
 		return {
 			"detail": _("Created {0} {1}").format(params["doctype"], target.name),
 			"destination_reference": {"doctype": target.doctype, "name": target.name},
@@ -169,6 +172,7 @@ class IncrementFieldValue(AutomationAction):
 		old_value = flt(doc.get(field))
 		doc.set(field, old_value + amount)
 		doc.save()
+		usage.report(writes=1, records_changed=1)
 		return {
 			"detail": _("Changed {0} by {1}").format(field, amount),
 			"old_value": old_value,

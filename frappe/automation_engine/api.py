@@ -296,7 +296,14 @@ def _trial_queue_row(rule, docname) -> str:
 def _trial_result(row_name: str, docname: str | None) -> dict:
 	name = frappe.db.get_value(RUN, {"queue_row": row_name})
 	if not name:
-		return {"status": "Failed", "document": docname, "steps": [], "branches": {}, "error_summary": None}
+		return {
+			"status": "Failed",
+			"document": docname,
+			"steps": [],
+			"branches": {},
+			"error_summary": None,
+			"usage": None,
+		}
 	run = frappe.get_doc(RUN, name)
 	state = frappe.parse_json(run.run_state) if run.run_state else {}
 	return {
@@ -305,4 +312,5 @@ def _trial_result(row_name: str, docname: str | None) -> dict:
 		"steps": run_steps(run),
 		"branches": state.get("branches") or {},
 		"error_summary": run.error_summary,
+		"usage": state.get("usage"),
 	}

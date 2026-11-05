@@ -17,7 +17,13 @@ DEFAULTS = frappe._dict(
 	commit_every=50,
 	queue_retention_days=7,
 	step_output_limit=65536,
-	max_steps_per_run=1000,
+	# Per execution (the stretch of a run between waits), after the Salesforce flow limits.
+	max_steps_per_run=2000,
+	max_queries_per_run=100,
+	max_records_read_per_run=50000,
+	max_writes_per_run=150,
+	max_records_changed_per_run=10000,
+	max_seconds_per_run=60,
 	event_payload_limit=65536,
 	allow_unregistered_events=0,
 )

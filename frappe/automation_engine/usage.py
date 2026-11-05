@@ -30,6 +30,13 @@ def report(queries: int = 0, records_read: int = 0, writes: int = 0, records_cha
 	usage["records_changed"] += records_changed
 
 
+def take() -> dict:
+	"""The totals since the last take, and start counting again from zero."""
+	taken = dict(current())
+	reset()
+	return taken
+
+
 def reset():
 	"""Start counting from zero, as the runner does at the start of an execution."""
 	frappe.flags.automation_usage = dict.fromkeys(KEYS, 0)

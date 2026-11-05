@@ -6,7 +6,7 @@ from contextlib import contextmanager
 
 import frappe
 from frappe import _
-from frappe.automation_engine import settings
+from frappe.automation_engine import settings, usage
 from frappe.automation_engine.actions.base import StopAutomation, get_action_registry
 from frappe.automation_engine.conditions import condition_values, evaluate_related_condition
 from frappe.automation_engine.dispatch import matches_rule
@@ -24,6 +24,7 @@ from frappe.utils import add_to_date, cint, now
 
 RUN = "Automation Run"
 LOOP_ARM = "Loop"
+EXECUTION_SAVEPOINT = "auto_exec"
 STEP_FIELDS = (
 	"step_idx",
 	"step_key",
@@ -47,8 +48,46 @@ WAIT_UNIT_SECONDS = {"Seconds": 1, "Minutes": 60, "Hours": 3600, "Days": 86400}
 NO_ERROR = {"message": "", "step_key": ""}
 
 
-class StepLimitReached(frappe.ValidationError):
-	pass
+# The limits on one execution (the stretch of a run between waits), after the Salesforce flow
+# limits: what is counted, the setting that holds the limit, and what the failure says.
+LIMITS = {
+	"steps": ("max_steps_per_run", "Step limit reached ({0})"),
+	"queries": ("max_queries_per_run", "Query limit reached ({0}): the flow ran {1} queries in one go"),
+	"records_read": (
+		"max_records_read_per_run",
+		"Records-read limit reached ({0}): the flow read {1} records in one go",
+	),
+	"writes": (
+		"max_writes_per_run",
+		"Write limit reached ({0}): the flow made {1} write operations in one go",
+	),
+	"records_changed": (
+		"max_records_changed_per_run",
+		"Records-changed limit reached ({0}): the flow changed {1} records in one go",
+	),
+	"seconds": (
+		"max_seconds_per_run",
+		"Time limit reached ({0} seconds): the flow had been running for {1} seconds",
+	),
+}
+COUNTED = ("steps", *usage.KEYS)
+
+
+class ExecutionLimitReached(frappe.ValidationError):
+	"""An execution went past one of its limits.
+
+	Not an ordinary step failure: nothing in the flow, a Fault path included, may handle it, and
+	everything the execution changed is undone.
+	"""
+
+	def __init__(self, kind, limit, used):
+		self.kind, self.limit, self.used = kind, limit, used
+		super().__init__(_(LIMITS[kind][1]).format(limit, used))
+
+
+class StepLimitReached(ExecutionLimitReached):
+	def __init__(self, limit, used):
+		super().__init__("steps", limit, used)
 
 
 def execute_automation(queue_name: str):
@@ -79,6 +118,8 @@ def _execute_plan(rule, row, run, doc, steps, snapshot, event):
 		with _execution_identity(rule, row, doc):
 			_ensure_trigger_access(doc)
 			context = _context(row, run, rule, doc, event)
+			usage.reset()
+			frappe.db.savepoint(EXECUTION_SAVEPOINT)
 			status = _run_plan(steps, rule, doc, context, snapshot, cint(row.resume_from_idx))
 		return status, context
 	except Exception:
@@ -180,7 +221,10 @@ def _context(row, run, rule, doc, event=None) -> dict:
 		"records": state.get("records") or resolve_relationships(doc, frappe.parse_json(run.relationships)),
 		"branches": state.get("branches") or {},
 		"loops": state.get("loops") or {},
-		"executed": cint(state.get("executed")),
+		# Counted from zero on every execution, including the one after a wait.
+		"usage": dict.fromkeys(COUNTED, 0),
+		"started": time.monotonic(),
+		"external": [],
 		# What the failed action said, while its Fault path is running; empty everywhere else.
 		"error": state.get("error") or dict(NO_ERROR),
 		"fault_span": state.get("fault_span"),
@@ -217,6 +261,28 @@ def _ensure_trigger_access(doc):
 
 
 def _run_plan(steps, rule, doc, context, snapshot, start_idx=0) -> str:
+	"""Walk the snapshot; going past a limit undoes the whole execution and fails the run."""
+	try:
+		return _walk_plan(steps, rule, doc, context, snapshot, start_idx)
+	except ExecutionLimitReached as error:
+		return _abort_execution(steps, context, error)
+
+
+def _abort_execution(steps, context, error) -> str:
+	"""Undo everything this execution changed, keep the log, and fail the run."""
+	frappe.db.rollback(save_point=EXECUTION_SAVEPOINT)
+	usage.reset()
+	step, pos = context.get("at") or ({"step_key": "limit"}, len(steps))
+	note = _limit_note(error)
+	if context["external"]:
+		note["detail"] = note["message"] = f"{note['message']}\n" + _(
+			"Not undone, because it already left the database: {0}"
+		).format(", ".join(context["external"]))
+	_append_step(steps, step, pos, "Failed", note, 0, _iteration(context, pos))
+	return "Failed"
+
+
+def _walk_plan(steps, rule, doc, context, snapshot, start_idx=0) -> str:
 	"""Walk the snapshot, honouring branch arms, loops and jumps, and skipping what already ran."""
 	registry = get_action_registry()
 	taken = context["branches"]
@@ -225,6 +291,7 @@ def _run_plan(steps, rule, doc, context, snapshot, start_idx=0) -> str:
 	pos = 0
 	while pos < len(snapshot):
 		step = snapshot[pos]
+		context["at"] = (step, pos)
 		if pos >= start_idx:
 			start_idx = 0
 		status, detail, duration = _safe_step_outcome(registry, step, doc, context, pos, start_idx, taken)
@@ -235,15 +302,9 @@ def _run_plan(steps, rule, doc, context, snapshot, start_idx=0) -> str:
 				return "Waiting"
 			if status == "Failed":
 				overall = "Partially Failed"
-				if not _enter_fault_path(step, detail, pos, context, taken) and (
-					rule.stop_on_error or context.get("limit_hit")
-				):
+				if not _enter_fault_path(step, detail, pos, context, taken) and rule.stop_on_error:
 					return "Failed"
-		try:
-			following = _next_position(snapshot, context, pos, start_idx)
-		except StepLimitReached as error:
-			_append_step(steps, step, pos, "Failed", _limit_note(error), 0, _iteration(context, pos))
-			return "Failed"
+		following = _next_position(snapshot, context, pos, start_idx)
 		_leave_fault_path(context, following)
 		if following != pos + 1:
 			start_idx = 0
@@ -258,7 +319,7 @@ def _enter_fault_path(step, detail, pos, context, taken) -> bool:
 	them the ones the walk takes next. The limit on the run is never handled this way.
 	"""
 	end = context["plan"]["fault_end"].get(pos)
-	if end is None or context.get("limit_hit"):
+	if end is None:
 		return False
 	taken[_branch_key(step.get("idx"))] = "Fault"
 	message = detail.get("message") if isinstance(detail, dict) else None
@@ -278,8 +339,8 @@ def _leave_fault_path(context, following):
 def _safe_step_outcome(registry, step, doc, context, pos, start_idx, taken):
 	try:
 		return _step_outcome(registry, step, doc, context, pos, start_idx, taken)
-	except StepLimitReached as error:
-		return "Failed", _limit_note(error), 0
+	except ExecutionLimitReached:
+		raise
 	except Exception:
 		return "Failed", frappe.get_traceback(), 0
 
@@ -308,12 +369,42 @@ def _step_outcome(registry, step, doc, context, pos, start_idx, taken):
 
 
 def _count_step(context):
-	"""Count one step execution against the run's budget; a loop or jump cannot outlive it."""
-	context["executed"] += 1
-	limit = settings.get("max_steps_per_run")
-	if context["executed"] > limit:
-		context["limit_hit"] = True
-		raise StepLimitReached(_("Step limit reached ({0})").format(limit))
+	"""Count one step execution against the execution's budget; a loop or jump cannot outlive it.
+
+	This is also where the clock is read: between steps, so one long step is never cut short.
+	"""
+	context["usage"]["steps"] += 1
+	if context["usage"]["steps"] > settings.get("max_steps_per_run"):
+		raise StepLimitReached(settings.get("max_steps_per_run"), context["usage"]["steps"])
+	elapsed = time.monotonic() - context["started"]
+	if elapsed > settings.get("max_seconds_per_run"):
+		raise ExecutionLimitReached("seconds", settings.get("max_seconds_per_run"), round(elapsed, 1))
+
+
+def _account_usage(context, handler, status):
+	"""Add what the action just consumed to the execution's totals, and hold them to the limits."""
+	taken = usage.take()
+	if status == "Success" and handler and handler.transactional and not any(taken.values()):
+		taken["writes"] = 1  # an action that does not report is assumed to write once
+	for key in usage.KEYS:
+		context["usage"][key] += taken[key]
+	if handler and not handler.transactional and status == "Success":
+		context["external"].append(context["at"][0].get("step_key") or "")
+	for kind in usage.KEYS:
+		limit = settings.get(LIMITS[kind][0])
+		if context["usage"][kind] > limit:
+			raise ExecutionLimitReached(kind, limit, context["usage"][kind])
+
+
+def _usage_report(context) -> dict:
+	"""The execution's totals next to the limits they were held to, for the run and the test run."""
+	limits = {kind: settings.get(LIMITS[kind][0]) for kind in COUNTED}
+	limits["seconds"] = settings.get(LIMITS["seconds"][0])
+	return {
+		**context["usage"],
+		"seconds": round(time.monotonic() - context["started"], 1),
+		"limits": limits,
+	}
 
 
 def _limit_note(error) -> dict:
@@ -584,8 +675,10 @@ def _run_one(registry, step, doc, context, idx):
 	for last_attempt in (False, True):
 		outcome = _try_action(handler, step, doc, context, params, savepoint, idx, started)
 		if outcome[0] != "Retry":
+			_account_usage(context, handler, outcome[0])
 			return outcome
 		if last_attempt:
+			_account_usage(context, handler, "Failed")
 			return "Failed", outcome[1], outcome[2]
 		if doc:
 			doc.reload()
@@ -768,7 +861,8 @@ def _run_values(status, steps, error_summary, context=None) -> dict:
 				"records": context["records"],
 				"branches": context["branches"],
 				"loops": context["loops"],
-				"executed": context["executed"],
+				"executed": context["usage"]["steps"],
+				"usage": _usage_report(context),
 				"error": context["error"],
 				"fault_span": context["fault_span"],
 			}

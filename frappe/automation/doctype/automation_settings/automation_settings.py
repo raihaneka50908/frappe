@@ -21,7 +21,12 @@ class AutomationSettings(Document):
 		failure_threshold: DF.Int
 		max_attempts: DF.Int
 		max_depth: DF.Int
+		max_queries_per_run: DF.Int
+		max_records_changed_per_run: DF.Int
+		max_records_read_per_run: DF.Int
+		max_seconds_per_run: DF.Int
 		max_steps_per_run: DF.Int
+		max_writes_per_run: DF.Int
 		queue_retention_days: DF.Int
 		stale_running_minutes: DF.Int
 		step_output_limit: DF.Int
