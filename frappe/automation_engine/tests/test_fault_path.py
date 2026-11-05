@@ -133,6 +133,13 @@ class TestFaultPath(AutomationRunnerTestCase):
 		)
 		self.assertEqual(frappe.db.get_value("ToDo", todo.name, "description"), "took if")
 
+	def test_a_test_run_does_not_leave_the_failure_as_a_message_for_the_user(self):
+		todo = make_todo(description="start")
+		auto = make_automation([failing_create(), fault(set_field("description", "handled"), 1)])
+		before = len(frappe.local.message_log)
+		trial_run(auto, todo.name)
+		self.assertEqual(len(frappe.local.message_log), before)
+
 	def test_a_test_run_shows_the_fault_path_and_changes_nothing(self):
 		todo = make_todo(description="start")
 		auto = make_automation([failing_create(), fault(set_field("description", "handled"), 1)])

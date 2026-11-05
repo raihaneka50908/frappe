@@ -244,6 +244,7 @@ def trial_run(
 			"conditions_skipped": False,
 		}
 	frappe.db.savepoint(TRIAL_SAVEPOINT)
+	logged = len(frappe.local.message_log)
 	try:
 		with _trial_mode(overrides, user):
 			row_name = _trial_queue_row(rule, docname)
@@ -254,6 +255,8 @@ def trial_run(
 			return result
 	finally:
 		frappe.db.rollback(save_point=TRIAL_SAVEPOINT)
+		# What a failed step threw is in the trace; it should not also pop up as a dialog.
+		del frappe.local.message_log[logged:]
 
 
 def _start_conditions_met(rule, docname) -> bool:
